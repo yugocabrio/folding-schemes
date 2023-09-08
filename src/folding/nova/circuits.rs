@@ -1,3 +1,7 @@
+use ark_crypto_primitives::sponge::{
+    constraints::CryptographicSpongeVar,
+    poseidon::{constraints::PoseidonSpongeVar, PoseidonConfig},
+};
 use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::Field;
 use ark_r1cs_std::{
@@ -8,7 +12,7 @@ use ark_r1cs_std::{
     groups::GroupOpsBounds,
     prelude::CurveVar,
 };
-use ark_relations::r1cs::{Namespace, SynthesisError};
+use ark_relations::r1cs::{ConstraintSystemRef, Namespace, SynthesisError};
 use core::{borrow::Borrow, marker::PhantomData};
 
 use super::CommittedInstance;
@@ -155,6 +159,56 @@ where
     }
 }
 
+pub struct AugmentedFGadget<C1, GC1, C2, GC2>
+where
+    C1: CurveGroup,
+    GC1: CurveVar<C1, CF1<C1>>,
+    C2: CurveGroup,
+    GC2: CurveVar<C2, CF2<C2>>,
+    C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
+{
+    _c1: PhantomData<C1>,
+    _gc1: PhantomData<GC1>,
+    _c2: PhantomData<C2>,
+    _gc2: PhantomData<GC2>,
+}
+
+impl<C1, GC1, C2, GC2> AugmentedFGadget<C1, GC1, C2, GC2>
+where
+    C1: CurveGroup,
+    GC1: CurveVar<C1, CF1<C1>>,
+    C2: CurveGroup,
+    GC2: CurveVar<C2, CF2<C2>>,
+    C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
+    <C2 as ark_ec::CurveGroup>::BaseField: ark_ff::PrimeField, // WIP
+    for<'a> &'a GC2: GroupOpsBounds<'a, C2, GC2>,
+{
+    /// returns `H(i, z_0, z_i, U_i)`, where `i` can be `i` but also `i+1`, and `U` is the
+    /// `CommittedInstance`
+    fn hash_committed_instance(
+        cs: ConstraintSystemRef<CF1<C1>>,
+        poseidon_config: PoseidonConfig<CF1<C1>>,
+        i: FpVar<CF1<C1>>,
+        z_0: FpVar<CF1<C1>>,
+        z_i: FpVar<CF1<C1>>,
+        ciE1: CommittedInstanceE1Var<C1>,
+        ciE2: CommittedInstanceE2Var<C2, GC2>, // WIP: see L#204 comment
+    ) -> Result<FpVar<CF1<C1>>, SynthesisError> {
+        let mut sponge = PoseidonSpongeVar::<CF1<C1>>::new(cs, &poseidon_config);
+
+        // absorb i, z_0, z_i, and u & x from CI
+        sponge.absorb(&vec![i, z_0, z_i, ciE1.u])?;
+        sponge.absorb(&ciE1.x)?;
+
+        // absorb cmE & cmW coordinates from CI
+        // TODO: convert the coordinates into limbs (since they are non-native in the constraint
+        // field). Probably get them as inputs already in limbs in the constraint field.
+
+        let h = sponge.squeeze_field_elements(1).unwrap();
+        Ok(h[0].clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +323,25 @@ mod tests {
         NIFSCycleFoldGadget::<Projective, GVar>::verify(r_bitsVar, cmTVar, ci1Var, ci2Var, ci3Var)
             .unwrap();
         assert!(cs_CC.is_satisfied().unwrap());
+    }
+
+    #[test]
+    fn test_hash_committed_instance() {
+        let mut rng = ark_std::test_rng();
+
+        let ci = CommittedInstance::<Projective> {
+            cmE: Projective::rand(&mut rng),
+            u: Fr::rand(&mut rng),
+            cmW: Projective::rand(&mut rng),
+            x: vec![Fr::rand(&mut rng); 1],
+        };
+
+        let cs = ConstraintSystem::<Fr>::new_ref();
+
+        let ci1Var =
+            CommittedInstanceE1Var::<Projective>::new_witness(cs.clone(), || Ok(ci.clone()))
+                .unwrap();
+
+        // TODO: pass the ci2Var cmE & cmW coordinates to hash_committed_instance as limbs in Fr
     }
 }
